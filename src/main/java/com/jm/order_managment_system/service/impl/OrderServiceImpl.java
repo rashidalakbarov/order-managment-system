@@ -18,11 +18,12 @@ import com.jm.order_managment_system.service.OrderService;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import lombok.RequiredArgsConstructor;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.GrantedAuthority;
@@ -43,7 +44,8 @@ public class OrderServiceImpl implements OrderService {
     @Transactional
     public OrderResponse createOrder(CreateOrderRequest request) {
         User user = resolveCurrentUser();
-        Map<Long, Product> productMap = getProductMap(request.items());
+        Map<Long, Integer> requestedQuantities = normalizeRequestedQuantities(request);
+        Map<Long, Product> productMap = getProductMap(requestedQuantities.keySet());
         Order order = Order.builder()
                 .user(user)
                 .status(OrderStatus.PENDING)
@@ -53,36 +55,36 @@ public class OrderServiceImpl implements OrderService {
         BigDecimal totalPrice = BigDecimal.ZERO;
         List<OrderItem> orderItems = new ArrayList<>();
 
-        // TODO: handle concurrent stock updates using optimistic locking
-        for (CreateOrderItemRequest itemRequest : request.items()) {
-            Product product = productMap.get(itemRequest.productId());
+        for (Map.Entry<Long, Integer> entry : requestedQuantities.entrySet()) {
+            Product product = productMap.get(entry.getKey());
+            Integer quantity = entry.getValue();
 
-            if (product.getStock() < itemRequest.quantity()) {
+            if (product.getStock() < quantity) {
                 throw new BusinessException("Insufficient stock for product: " + product.getName());
             }
 
-            product.setStock(product.getStock() - itemRequest.quantity());
+            product.setStock(product.getStock() - quantity);
 
             OrderItem orderItem = OrderItem.builder()
                     .order(order)
                     .product(product)
-                    .quantity(itemRequest.quantity())
+                    .quantity(quantity)
                     .price(product.getPrice())
                     .build();
 
             orderItems.add(orderItem);
-            totalPrice = totalPrice.add(product.getPrice().multiply(BigDecimal.valueOf(itemRequest.quantity())));
+            totalPrice = totalPrice.add(product.getPrice().multiply(BigDecimal.valueOf(quantity)));
         }
 
         order.setItems(orderItems);
         order.setTotalPrice(totalPrice);
 
-        productRepository.saveAll(productMap.values());
+        persistProducts(productMap.values(), "Stock changed while creating the order. Please retry.");
         return orderMapper.toResponse(orderRepository.save(order));
     }
 
     @Override
-    @Transactional
+    @Transactional(readOnly = true)
     public List<OrderResponse> getMyOrders() {
         return mapToResponses(getOrdersForUser(resolveCurrentUser().getId()));
     }
@@ -90,6 +92,17 @@ public class OrderServiceImpl implements OrderService {
     @Override
     @Transactional(readOnly = true)
     public List<OrderResponse> getOrders(Long userId) {
+        User currentUser = resolveCurrentUser();
+        boolean admin = isAdmin();
+
+        if (!admin && userId == null) {
+            throw new AccessDeniedException("Only admins can view all orders");
+        }
+
+        if (!admin && !currentUser.getId().equals(userId)) {
+            throw new AccessDeniedException("You are not allowed to view these orders");
+        }
+
         List<Order> orders = userId == null ? orderRepository.findAll() : getOrdersForUser(userId);
         return mapToResponses(orders);
     }
@@ -107,7 +120,6 @@ public class OrderServiceImpl implements OrderService {
             throw new BusinessException("Only pending orders can be cancelled");
         }
 
-        // TODO: handle concurrent stock updates using optimistic locking
         for (OrderItem item : order.getItems()) {
             Product product = item.getProduct();
             product.setStock(product.getStock() + item.getQuantity());
@@ -117,9 +129,9 @@ public class OrderServiceImpl implements OrderService {
         order.setCancelledAt(LocalDateTime.now());
         order.setCancelledBy(currentUser.getEmail());
 
-        productRepository.saveAll(order.getItems().stream()
+        persistProducts(order.getItems().stream()
                 .map(OrderItem::getProduct)
-                .toList());
+                .toList(), "Stock changed while cancelling the order. Please retry.");
         return orderMapper.toResponse(orderRepository.save(order));
     }
 
@@ -133,11 +145,28 @@ public class OrderServiceImpl implements OrderService {
                 .toList();
     }
 
-    private Map<Long, Product> getProductMap(List<CreateOrderItemRequest> items) {
-        Set<Long> productIds = items.stream()
-                .map(CreateOrderItemRequest::productId)
-                .collect(java.util.stream.Collectors.toSet());
+    private Map<Long, Integer> normalizeRequestedQuantities(CreateOrderRequest request) {
+        if (request == null || request.items() == null || request.items().isEmpty()) {
+            throw new BusinessException("Order must contain at least one item");
+        }
 
+        Map<Long, Integer> requestedQuantities = new LinkedHashMap<>();
+        for (CreateOrderItemRequest item : request.items()) {
+            if (item.productId() == null) {
+                throw new BusinessException("Product id is required");
+            }
+
+            if (item.quantity() == null || item.quantity() < 1) {
+                throw new BusinessException("Quantity must be greater than zero");
+            }
+
+            requestedQuantities.merge(item.productId(), item.quantity(), Integer::sum);
+        }
+
+        return requestedQuantities;
+    }
+
+    private Map<Long, Product> getProductMap(java.util.Set<Long> productIds) {
         List<Product> products = productRepository.findAllById(productIds);
         Map<Long, Product> productMap = new LinkedHashMap<>();
         products.forEach(product -> productMap.put(product.getId(), product));
@@ -150,17 +179,9 @@ public class OrderServiceImpl implements OrderService {
     }
 
     private User resolveCurrentUser() {
-        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
-
-        if (authentication != null && authentication.isAuthenticated()
-                && authentication.getName() != null
-                && !"anonymousUser".equals(authentication.getName())) {
-            return userRepository.findByEmail(authentication.getName())
-                    .orElseThrow(() -> new NotFoundException("Authenticated user not found"));
-        }
-
-        return userRepository.findFirstByOrderByIdAsc()
-                .orElseGet(this::createDummyUser);
+        Authentication authentication = getRequiredAuthentication();
+        return userRepository.findByEmail(authentication.getName())
+                .orElseThrow(() -> new NotFoundException("Authenticated user not found"));
     }
 
     private void validateCancelPermission(Order order, User currentUser) {
@@ -174,21 +195,36 @@ public class OrderServiceImpl implements OrderService {
     }
 
     private boolean isAdmin() {
-        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
-
-        if (authentication == null) {
-            return false;
-        }
-
-        return authentication.getAuthorities().stream()
+        Authentication authentication = getAuthenticationOrNull();
+        return authentication != null && authentication.getAuthorities().stream()
                 .map(GrantedAuthority::getAuthority)
                 .anyMatch("ROLE_ADMIN"::equals);
     }
 
-    private User createDummyUser() {
-        return userRepository.save(User.builder()
-                .name("Demo User")
-                .email("demo.user@example.com")
-                .build());
+    private Authentication getRequiredAuthentication() {
+        Authentication authentication = getAuthenticationOrNull();
+        if (authentication == null) {
+            throw new AccessDeniedException("Authentication is required for this operation");
+        }
+        return authentication;
+    }
+
+    private Authentication getAuthenticationOrNull() {
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        if (authentication == null
+                || !authentication.isAuthenticated()
+                || authentication.getName() == null
+                || "anonymousUser".equals(authentication.getName())) {
+            return null;
+        }
+        return authentication;
+    }
+
+    private void persistProducts(Collection<Product> products, String concurrencyMessage) {
+        try {
+            productRepository.saveAllAndFlush(products);
+        } catch (OptimisticLockingFailureException exception) {
+            throw new OptimisticLockingFailureException(concurrencyMessage, exception);
+        }
     }
 }
